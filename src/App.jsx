@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   BrowserRouter,
   Link,
   NavLink,
   Route,
   Routes,
+  useLocation,
   useNavigate,
   useParams,
   useSearchParams,
@@ -36,7 +37,19 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
-import { categoryCards, faqList, fragranceNotes, products, reviews, scentProfiles, siteConfig } from './data/products';
+import {
+  categoryCards,
+  faqList,
+  fragranceNotes,
+  reviews,
+  scentProfiles,
+  siteConfig,
+} from './data/products';
+import { filterProducts, getProducts } from './services/productService';
+import { createOrder } from './services/orderService';
+import { CartProvider, useCart } from './context/CartContext';
+import { WishlistProvider, useWishlist } from './context/WishlistContext';
+import { isFirebaseConfigured } from './firebase/config';
 import './App.css';
 
 const formatPrice = (value) => {
@@ -44,9 +57,28 @@ const formatPrice = (value) => {
   return `Rs. ${safeValue.toLocaleString('en-PK')}`;
 };
 
+const isProductAvailable = (product) => product?.available !== false && (product?.stock == null || Number(product.stock) > 0);
+
 function App() {
-  const [cart, setCart] = useState([]);
-  const [wishlist, setWishlist] = useState([]);
+  return (
+    <CartProvider>
+      <WishlistProvider>
+        <BrowserRouter>
+          <AppContent />
+        </BrowserRouter>
+      </WishlistProvider>
+    </CartProvider>
+  );
+}
+
+function AppContent() {
+  const navigate = useNavigate();
+  const { cart, cartCount, subtotal, shipping, total, addItem, updateQty, removeItem, clearCart } = useCart();
+  const { wishlist, toggleWishlist } = useWishlist();
+  const [catalog, setCatalog] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [cartOpen, setCartOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -60,52 +92,58 @@ function App() {
     return () => clearTimeout(timer);
   }, [toasts]);
 
+  useEffect(() => {
+    let active = true;
+
+    async function loadProducts() {
+      setLoading(true);
+      setError('');
+
+      try {
+        const results = await getProducts();
+        if (active) {
+          setCatalog(results);
+        }
+      } catch (loadError) {
+        if (active) {
+          setCatalog([]);
+          setError(isFirebaseConfigured ? loadError.message : 'Firebase configuration is required to load products. Add the VITE_FIREBASE_* settings to the environment before using the storefront.');
+        }
+      } finally {
+        if (active) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadProducts();
+    return () => {
+      active = false;
+    };
+  }, [loadAttempt]);
+
   const showToast = (message) => {
     const id = Date.now() + Math.random();
     setToasts((current) => [...current, { id, message }]);
   };
 
-  const addToCart = (product, quantity = 1) => {
-    setCart((current) => {
-      const existing = current.find((item) => item.id === product.id);
-      if (existing) {
-        return current.map((item) =>
-          item.id === product.id ? { ...item, quantity: item.quantity + quantity } : item,
-        );
-      }
-      return [...current, { id: product.id, quantity, product }];
-    });
-
+  const handleAddToCart = (product, quantity = 1) => {
+    if (!product || !isProductAvailable(product)) {
+      showToast('This fragrance is currently unavailable');
+      return;
+    }
+    const alreadyInCart = cart.find((item) => item.productId === product.id)?.quantity || 0;
+    const stockLimit = product.stock == null ? 99 : Number(product.stock);
+    const remaining = Math.max(0, Math.min(99, stockLimit) - alreadyInCart);
+    if (remaining === 0) {
+      showToast('No additional stock is available');
+      return;
+    }
+    const addedQuantity = Math.min(quantity, remaining);
+    addItem(product, addedQuantity);
     setCartOpen(true);
-    showToast(`${product.name} added to cart`);
+    showToast(addedQuantity < quantity ? `Only ${addedQuantity} more available` : `${product.name} added to cart`);
   };
-
-  const removeFromCart = (productId) => {
-    setCart((current) => current.filter((item) => item.id !== productId));
-  };
-
-  const updateCartQty = (productId, nextQty) => {
-    setCart((current) =>
-      current
-        .map((item) =>
-          item.id === productId ? { ...item, quantity: Math.max(0, nextQty) } : item,
-        )
-        .filter((item) => item.quantity > 0),
-    );
-  };
-
-  const toggleWishlist = (productId) => {
-    setWishlist((current) =>
-      current.includes(productId)
-        ? current.filter((item) => item !== productId)
-        : [...current, productId],
-    );
-  };
-
-  const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
-  const cartSubtotal = cart.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
-  const shipping = cartSubtotal > 5000 ? 0 : 350;
-  const grandTotal = cartSubtotal + shipping;
 
   const navLinks = [
     { to: '/', label: 'Home' },
@@ -130,91 +168,111 @@ function App() {
   ];
 
   return (
-    <BrowserRouter>
-      <div className="site-shell">
-        <AnnouncementBar items={siteConfig.announcementBar} />
-        <Navbar
-          brandName={siteConfig.brandName}
-          navLinks={navLinks}
-          cartCount={cartCount}
-          wishlist={wishlist}
-          onOpenSearch={() => setSearchOpen(true)}
-          onOpenCart={() => setCartOpen(true)}
-          mobileMenuOpen={mobileMenuOpen}
-          setMobileMenuOpen={setMobileMenuOpen}
-          megaMenuItems={megaMenuItems}
-        />
+    <div className="site-shell">
+      <AnnouncementBar items={siteConfig.announcementBar} />
+      <Navbar
+        brandName={siteConfig.brandName}
+        navLinks={navLinks}
+        cartCount={cartCount}
+        wishlist={wishlist}
+        onOpenSearch={() => setSearchOpen(true)}
+        onOpenWishlist={() => navigate('/wishlist')}
+        onOpenCart={() => setCartOpen(true)}
+        mobileMenuOpen={mobileMenuOpen}
+        setMobileMenuOpen={setMobileMenuOpen}
+        megaMenuItems={megaMenuItems}
+      />
 
-        <CartDrawer
-          cart={cart}
-          open={cartOpen}
-          onClose={() => setCartOpen(false)}
-          onQuantityChange={updateCartQty}
-          onRemove={removeFromCart}
-          subtotal={cartSubtotal}
-          shipping={shipping}
-          total={grandTotal}
-          onCheckout={() => { setCartOpen(false); window.location.href = '/checkout'; }}
-        />
+      <CartDrawer
+        cart={cart}
+        open={cartOpen}
+        onClose={() => setCartOpen(false)}
+        onQuantityChange={updateQty}
+        onRemove={removeItem}
+        subtotal={subtotal}
+        shipping={shipping}
+        total={total}
+        onViewCart={() => {
+          setCartOpen(false);
+          navigate('/cart');
+        }}
+        onCheckout={() => {
+          setCartOpen(false);
+          navigate('/checkout');
+        }}
+      />
 
-        <SearchModal
-          open={searchOpen}
-          onClose={() => setSearchOpen(false)}
-          products={products}
-          onSelectProduct={() => setSearchOpen(false)}
-        />
+      <SearchModal
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        products={catalog}
+        onSelectProduct={() => setSearchOpen(false)}
+      />
 
-        <Routes>
-          <Route
-            path="/"
-            element={
-              <HomePage
-                products={products}
-                notes={fragranceNotes}
-                onAddToCart={addToCart}
-                wishlist={wishlist}
-                onWishlistToggle={toggleWishlist}
-                onOpenSearch={() => setSearchOpen(true)}
-              />
-            }
-          />
-          <Route
-            path="/shop"
-            element={
-              <ShopPage
-                products={products}
-                onAddToCart={addToCart}
-                wishlist={wishlist}
-                onWishlistToggle={toggleWishlist}
-              />
-            }
-          />
-          <Route path="/men" element={<ShopPage products={products.filter((p) => p.category === 'men')} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/women" element={<ShopPage products={products.filter((p) => p.category === 'women')} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/unisex" element={<ShopPage products={products.filter((p) => p.category === 'unisex')} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/new-arrivals" element={<ShopPage products={products.filter((product) => product.isNew)} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/best-sellers" element={<ShopPage products={products.filter((product) => product.isBestSeller)} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/gift-sets" element={<ShopPage products={products.filter((product) => product.category === 'unisex')} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/about" element={<AboutPage />} />
-          <Route path="/contact" element={<ContactPage />} />
-          <Route path="/faq" element={<FAQPage />} />
-          <Route path="/product/:id" element={<ProductPage products={products} onAddToCart={addToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
-          <Route path="/cart" element={<CartPage cart={cart} onUpdateQty={updateCartQty} onRemove={removeFromCart} onCheckout={() => showToast('Proceed to checkout')} />} />
-          <Route path="/checkout" element={<CheckoutPage cart={cart} subtotal={cartSubtotal} shipping={shipping} total={grandTotal} />} />
-        </Routes>
-
-        <Footer brandName={siteConfig.brandName} />
-
-        <div className="toast-stack" aria-live="polite" aria-atomic="true">
-          {toasts.map((toast) => (
-            <div key={toast.id} className="toast-item">
-              <Check size={15} />
-              <span>{toast.message}</span>
-            </div>
-          ))}
+      {error && (
+        <div className="page-shell narrow">
+          <div className="empty-state" role="alert">
+            <h3>Collection unavailable</h3>
+            <p>{error}</p>
+            {isFirebaseConfigured && <button type="button" className="secondary-button" onClick={() => setLoadAttempt((attempt) => attempt + 1)}>Retry</button>}
+          </div>
         </div>
+      )}
+
+      <Routes>
+        <Route
+          path="/"
+          element={
+            <HomePage
+              products={catalog}
+              notes={fragranceNotes}
+              onAddToCart={handleAddToCart}
+              wishlist={wishlist}
+              onWishlistToggle={toggleWishlist}
+              loading={loading}
+            />
+          }
+        />
+        <Route
+          path="/shop"
+          element={
+            <ShopPage
+              products={catalog}
+              loading={loading}
+              onAddToCart={handleAddToCart}
+              wishlist={wishlist}
+              onWishlistToggle={toggleWishlist}
+            />
+          }
+        />
+        <Route path="/men" element={<ShopPage products={catalog.filter((product) => product.category === 'men')} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/women" element={<ShopPage products={catalog.filter((product) => product.category === 'women')} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/unisex" element={<ShopPage products={catalog.filter((product) => product.category === 'unisex')} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/new-arrivals" element={<ShopPage products={catalog.filter((product) => product.isNew)} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/best-sellers" element={<ShopPage products={catalog.filter((product) => product.isBestSeller)} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/gift-sets" element={<ShopPage products={catalog.filter((product) => product.category === 'unisex')} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/about" element={<AboutPage />} />
+        <Route path="/contact" element={<ContactPage />} />
+        <Route path="/faq" element={<FAQPage />} />
+        <Route path="/product/:id" element={<ProductPage products={catalog} loading={loading} onAddToCart={handleAddToCart} wishlist={wishlist} onWishlistToggle={toggleWishlist} />} />
+        <Route path="/wishlist" element={<WishlistPage products={catalog} wishlist={wishlist} onWishlistToggle={toggleWishlist} onAddToCart={handleAddToCart} />} />
+        <Route path="/cart" element={<CartPage cart={cart} subtotal={subtotal} shipping={shipping} total={total} onUpdateQty={updateQty} onRemove={removeItem} />} />
+        <Route path="/checkout" element={<CheckoutPage cart={cart} subtotal={subtotal} shipping={shipping} total={total} onShowToast={showToast} onClearCart={clearCart} />} />
+        <Route path="/order-success" element={<OrderSuccessPage />} />
+        <Route path="*" element={<NotFoundPage />} />
+      </Routes>
+
+      <Footer brandName={siteConfig.brandName} />
+
+      <div className="toast-stack" aria-live="polite" aria-atomic="true">
+        {toasts.map((toast) => (
+          <div key={toast.id} className="toast-item">
+            <Check size={15} />
+            <span>{toast.message}</span>
+          </div>
+        ))}
       </div>
-    </BrowserRouter>
+    </div>
   );
 }
 
@@ -230,7 +288,7 @@ function AnnouncementBar({ items }) {
   );
 }
 
-function Navbar({ brandName, navLinks, cartCount, wishlist, onOpenSearch, onOpenCart, mobileMenuOpen, setMobileMenuOpen, megaMenuItems }) {
+function Navbar({ brandName, navLinks, cartCount, wishlist, onOpenSearch, onOpenWishlist, onOpenCart, mobileMenuOpen, setMobileMenuOpen, megaMenuItems }) {
   const [hoverShop, setHoverShop] = useState(false);
 
   return (
@@ -252,11 +310,7 @@ function Navbar({ brandName, navLinks, cartCount, wishlist, onOpenSearch, onOpen
             </NavLink>
           ))}
 
-          <div
-            className="shop-menu-wrap"
-            onMouseEnter={() => setHoverShop(true)}
-            onMouseLeave={() => setHoverShop(false)}
-          >
+          <div className="shop-menu-wrap" onMouseEnter={() => setHoverShop(true)} onMouseLeave={() => setHoverShop(false)}>
             <button type="button" className="shop-toggle nav-link">
               Shop <ChevronDown size={14} />
             </button>
@@ -294,7 +348,7 @@ function Navbar({ brandName, navLinks, cartCount, wishlist, onOpenSearch, onOpen
           <button type="button" className="icon-button desktop-only" aria-label="Account">
             <User size={18} />
           </button>
-          <button type="button" className="icon-button desktop-only" aria-label="Wishlist">
+          <button type="button" className="icon-button" aria-label="Wishlist" onClick={onOpenWishlist}>
             <Heart size={18} />
             {wishlist.length > 0 && <span className="pill-count">{wishlist.length}</span>}
           </button>
@@ -331,11 +385,11 @@ function SearchModal({ open, onClose, products, onSelectProduct }) {
       (product) =>
         product.name.toLowerCase().includes(normalized) ||
         product.brand.toLowerCase().includes(normalized) ||
-        product.notes.some((note) => note.toLowerCase().includes(normalized)),
+        (product.notes || []).some((note) => note.toLowerCase().includes(normalized)),
     );
   }, [products, query]);
 
-  const popularSearches = ['Oud', 'Vanilla', 'Dior', "Men's Perfume", "Women's Perfume", 'Gift Sets'];
+  const popularSearches = ['Oud', 'Vanilla', 'Luxury', 'Men', 'Women', 'Gift Sets'];
 
   if (!open) return null;
 
@@ -400,12 +454,12 @@ function SearchModal({ open, onClose, products, onSelectProduct }) {
   );
 }
 
-function CartDrawer({ cart, open, onClose, onQuantityChange, onRemove, subtotal, shipping, total, onCheckout }) {
+function CartDrawer({ cart, open, onClose, onQuantityChange, onRemove, subtotal, shipping, total, onViewCart, onCheckout }) {
   if (!open) return null;
 
   return (
     <div className="cart-backdrop" onClick={onClose}>
-      <aside className="cart-drawer" onClick={(event) => event.stopPropagation()} aria-label="Shopping cart panel">
+      <aside className="cart-drawer" onClick={(event) => event.stopPropagation()} aria-label="Shopping cart panel" role="dialog" aria-modal="true">
         <div className="drawer-header">
           <h3>Your Cart</h3>
           <button type="button" className="icon-button" aria-label="Close cart" onClick={onClose}>
@@ -424,22 +478,27 @@ function CartDrawer({ cart, open, onClose, onQuantityChange, onRemove, subtotal,
           <>
             <div className="cart-items">
               {cart.map((item) => (
-                <div key={item.id} className="cart-item-row">
-                  <img src={item.product.images[0]} alt={item.product.name} />
+                <div key={item.productId || item.id} className="cart-item-row">
+                  <img className="cart-thumbnail" src={item.product?.images?.[0] || item.image} alt={item.productName || item.product?.name} />
                   <div className="cart-item-meta">
-                    <strong>{item.product.name}</strong>
-                    <span>{formatPrice(item.product.price)}</span>
+                    <span className="cart-item-brand">{item.product?.brand || item.brand}</span>
+                    <strong>{item.productName || item.product?.name}</strong>
+                    {(item.variant || item.product?.size) && <span className="cart-item-size">{item.variant || item.product.size}</span>}
+                    <span>{formatPrice(item.price)} each</span>
                     <div className="quantity-box">
-                      <button type="button" aria-label={`Decrease quantity for ${item.product.name}`} onClick={() => onQuantityChange(item.id, item.quantity - 1)}>
+                      <button type="button" aria-label={`Decrease quantity for ${item.productName || item.product?.name}`} onClick={() => onQuantityChange(item.productId, item.quantity - 1)}>
                         <Minus size={14} />
                       </button>
                       <span>{item.quantity}</span>
-                      <button type="button" aria-label={`Increase quantity for ${item.product.name}`} onClick={() => onQuantityChange(item.id, item.quantity + 1)}>
+                      <button type="button" aria-label={`Increase quantity for ${item.productName || item.product?.name}`} onClick={() => onQuantityChange(item.productId, item.quantity + 1)}>
                         <Plus size={14} />
                       </button>
                     </div>
                   </div>
-                  <button type="button" className="text-button" onClick={() => onRemove(item.id)}>Remove</button>
+                  <div className="cart-item-trailing">
+                    <strong>{formatPrice(item.price * item.quantity)}</strong>
+                    <button type="button" className="text-button" onClick={() => onRemove(item.productId)}>Remove</button>
+                  </div>
                 </div>
               ))}
             </div>
@@ -450,7 +509,10 @@ function CartDrawer({ cart, open, onClose, onQuantityChange, onRemove, subtotal,
               <div className="grand-total"><span>Total</span><strong>{formatPrice(total)}</strong></div>
             </div>
 
-            <button type="button" className="primary-button wide" onClick={onCheckout}>Checkout</button>
+            <div className="cart-drawer-actions">
+              <Link to="/cart" className="secondary-button wide" onClick={onViewCart}>View Cart</Link>
+              <button type="button" className="primary-button wide" onClick={onCheckout}>Checkout</button>
+            </div>
           </>
         )}
       </aside>
@@ -460,13 +522,16 @@ function CartDrawer({ cart, open, onClose, onQuantityChange, onRemove, subtotal,
 
 function ProductCard({ product, wishlist, onWishlistToggle, onAddToCart, onQuickView }) {
   const isFavorite = wishlist.includes(product.id);
+  const available = isProductAvailable(product);
 
   return (
     <article className="product-card">
       <div className="product-image-wrap">
-        <img src={product.images[0]} alt={product.name} className="product-image" />
+        <Link to={`/product/${product.slug}`} className="product-image-link" aria-label={`View ${product.name}`}>
+          <img src={product.images[0]} alt={product.name} className="product-image" />
+        </Link>
         {product.discount > 0 && <span className="product-badge">-{product.discount}%</span>}
-        <button type="button" className={`wishlist-button ${isFavorite ? 'active' : ''}`} aria-label={`Add ${product.name} to wishlist`} onClick={() => onWishlistToggle(product.id)}>
+        <button type="button" className={`wishlist-button ${isFavorite ? 'active' : ''}`} aria-label={`${isFavorite ? 'Remove' : 'Add'} ${product.name} ${isFavorite ? 'from' : 'to'} wishlist`} onClick={(event) => { event.stopPropagation(); onWishlistToggle(product.id); }}>
           <Heart size={16} fill={isFavorite ? 'currentColor' : 'none'} />
         </button>
       </div>
@@ -488,8 +553,8 @@ function ProductCard({ product, wishlist, onWishlistToggle, onAddToCart, onQuick
 
       <div className="card-actions">
         <button type="button" className="ghost-button" onClick={() => onQuickView(product)}>Quick View</button>
-        <button type="button" className="primary-button" onClick={() => onAddToCart(product)}>
-          Add to Cart
+        <button type="button" className="primary-button" disabled={!available} onClick={(event) => { event.stopPropagation(); onAddToCart(product); }}>
+          {available ? 'Add to Cart' : 'Sold Out'}
         </button>
       </div>
     </article>
@@ -529,7 +594,7 @@ function TrustStrip() {
   );
 }
 
-function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, onOpenSearch }) {
+function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, loading }) {
   const navigate = useNavigate();
   const bestSellers = products.filter((product) => product.isBestSeller).slice(0, 4);
   const newArrivals = products.filter((product) => product.isNew).slice(0, 4);
@@ -549,10 +614,7 @@ function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, on
         </div>
         <div className="hero-visual">
           <div className="hero-bottle-wrap">
-            <img
-              src="https://images.unsplash.com/photo-1541643600914-78b084683601?auto=format&fit=crop&w=900&q=80"
-              alt="Luxury fragrance bottle"
-            />
+            <img src="https://images.unsplash.com/photo-1541643600914-78b084683601?auto=format&fit=crop&w=900&q=80" alt="Luxury fragrance bottle" />
           </div>
         </div>
       </section>
@@ -577,18 +639,11 @@ function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, on
 
       <section className="content-section">
         <SectionHeading eyebrow="Most Loved" title="Most Loved Fragrances" text="Discover the scents our customers keep coming back to." />
-        <div className="product-grid">
+        {loading ? <CatalogSkeleton /> : <div className="product-grid">
           {bestSellers.map((product) => (
-            <ProductCard
-              key={product.id}
-              product={product}
-              wishlist={wishlist}
-              onWishlistToggle={onWishlistToggle}
-              onAddToCart={onAddToCart}
-              onQuickView={setQuickViewProduct}
-            />
+            <ProductCard key={product.id} product={product} wishlist={wishlist} onWishlistToggle={onWishlistToggle} onAddToCart={onAddToCart} onQuickView={setQuickViewProduct} />
           ))}
-        </div>
+        </div>}
       </section>
 
       <section className="content-section notes-section">
@@ -618,18 +673,11 @@ function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, on
           <SectionHeading eyebrow="Just Arrived" title="Just Arrived" text="Fresh additions for your next signature scent." />
           <button type="button" className="secondary-button" onClick={() => navigate('/new-arrivals')}>View All New Arrivals</button>
         </div>
-        <div className="product-grid four-up">
+        {loading ? <CatalogSkeleton /> : <div className="product-grid four-up">
           {newArrivals.map((product) => (
-            <ProductCard
-              key={product.id}
-              product={product}
-              wishlist={wishlist}
-              onWishlistToggle={onWishlistToggle}
-              onAddToCart={onAddToCart}
-              onQuickView={setQuickViewProduct}
-            />
+            <ProductCard key={product.id} product={product} wishlist={wishlist} onWishlistToggle={onWishlistToggle} onAddToCart={onAddToCart} onQuickView={setQuickViewProduct} />
           ))}
-        </div>
+        </div>}
       </section>
 
       <section className="editorial-section">
@@ -693,39 +741,35 @@ function HomePage({ products, notes, onAddToCart, wishlist, onWishlistToggle, on
   );
 }
 
-function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
+function ShopPage({ products: list, loading, onAddToCart, wishlist, onWishlistToggle }) {
   const [searchParams, setSearchParams] = useSearchParams();
-  const navigate = useNavigate();
   const [viewMode, setViewMode] = useState('grid');
   const [mobileFilterOpen, setMobileFilterOpen] = useState(false);
   const [quickViewProduct, setQuickViewProduct] = useState(null);
 
   const category = searchParams.get('category') || 'all';
   const gender = searchParams.get('gender') || 'all';
+  const brand = searchParams.get('brand') || 'all';
+  const minPrice = searchParams.get('minPrice') || '';
+  const maxPrice = searchParams.get('maxPrice') || '';
   const notesParam = searchParams.get('notes') || 'all';
   const occasion = searchParams.get('occasion') || 'all';
   const query = searchParams.get('q') || '';
   const sort = searchParams.get('sort') || 'featured';
 
-  const filteredProducts = useMemo(() => {
-    const normalizedQuery = query.trim().toLowerCase();
-    return [...list]
-      .filter((product) => {
-        const categoryMatch = category === 'all' || product.category === category;
-        const genderMatch = gender === 'all' || product.gender === gender;
-        const notesMatch = notesParam === 'all' || product.notes.includes(notesParam);
-        const occasionMatch = occasion === 'all' || product.occasion === occasion;
-        const searchMatch = !normalizedQuery || [product.name, product.brand, product.notes.join(' '), product.fragranceFamily].join(' ').toLowerCase().includes(normalizedQuery);
-        return categoryMatch && genderMatch && notesMatch && occasionMatch && searchMatch;
-      })
-      .sort((a, b) => {
-        if (sort === 'price-low') return a.price - b.price;
-        if (sort === 'price-high') return b.price - a.price;
-        if (sort === 'rating') return b.rating - a.rating;
-        if (sort === 'newest') return Number(b.isNew) - Number(a.isNew);
-        return Number(b.isBestSeller) - Number(a.isBestSeller);
-      });
-  }, [category, gender, list, notesParam, occasion, query, sort]);
+  const filteredProducts = useMemo(() => filterProducts(list, {
+    query,
+    category,
+    gender,
+    brand,
+    minPrice,
+    maxPrice,
+    notes: notesParam,
+    occasion,
+    sort,
+  }), [brand, category, gender, list, maxPrice, minPrice, notesParam, occasion, query, sort]);
+
+  const brands = [...new Set(list.map((product) => product.brand).filter(Boolean))];
 
   const updateParam = (key, value) => {
     const next = new URLSearchParams(searchParams);
@@ -748,13 +792,7 @@ function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
         <div className="shop-controls">
           <div className="search-pill">
             <Search size={16} />
-            <input
-              type="search"
-              value={query}
-              onChange={(event) => updateParam('q', event.target.value)}
-              placeholder="Search products"
-              aria-label="Search products in shop"
-            />
+            <input type="search" value={query} onChange={(event) => updateParam('q', event.target.value)} placeholder="Search products" aria-label="Search products in shop" />
           </div>
           <select value={sort} onChange={(event) => updateParam('sort', event.target.value)} aria-label="Sort products">
             <option value="featured">Featured</option>
@@ -762,6 +800,7 @@ function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
             <option value="price-low">Price: Low to High</option>
             <option value="price-high">Price: High to Low</option>
             <option value="rating">Rating</option>
+            <option value="best-selling">Best Selling</option>
           </select>
           <button type="button" className="secondary-button mobile-only" onClick={() => setMobileFilterOpen(true)}>
             <Filter size={16} /> Filter
@@ -779,6 +818,14 @@ function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
           </div>
           <FilterGroup title="Category" options={['all', 'men', 'women', 'unisex']} value={category} onChange={(value) => updateParam('category', value)} />
           <FilterGroup title="Gender" options={['all', 'Men', 'Women', 'Unisex']} value={gender} onChange={(value) => updateParam('gender', value)} />
+          {brands.length > 0 && <FilterGroup title="Brand" options={['all', ...brands]} value={brand} onChange={(value) => updateParam('brand', value)} />}
+          <div className="filter-group">
+            <h4>Price</h4>
+            <div className="price-filter-fields">
+              <label><span>Min</span><input type="number" min="0" value={minPrice} onChange={(event) => updateParam('minPrice', event.target.value)} aria-label="Minimum price" /></label>
+              <label><span>Max</span><input type="number" min="0" value={maxPrice} onChange={(event) => updateParam('maxPrice', event.target.value)} aria-label="Maximum price" /></label>
+            </div>
+          </div>
           <FilterGroup title="Notes" options={['all', ...fragranceNotes]} value={notesParam} onChange={(value) => updateParam('notes', value)} />
           <FilterGroup title="Occasion" options={['all', 'Everyday', 'Office', 'Date Night', 'Evening', 'Formal', 'Summer', 'Winter']} value={occasion} onChange={(value) => updateParam('occasion', value)} />
           <div className="filter-actions">
@@ -788,14 +835,14 @@ function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
 
         <div className="shop-results">
           <div className="results-topbar">
-            <span>{filteredProducts.length} products</span>
+            <span>{loading ? 'Loading products…' : `${filteredProducts.length} products`}</span>
             <div className="view-toggle">
               <button type="button" className={viewMode === 'grid' ? 'active' : ''} onClick={() => setViewMode('grid')}>Grid</button>
               <button type="button" className={viewMode === 'list' ? 'active' : ''} onClick={() => setViewMode('list')}>List</button>
             </div>
           </div>
 
-          {filteredProducts.length === 0 ? (
+          {loading ? <CatalogSkeleton /> : filteredProducts.length === 0 ? (
             <div className="empty-state">
               <Sparkles size={32} />
               <h3>No products match your filters</h3>
@@ -805,14 +852,7 @@ function ShopPage({ products: list, onAddToCart, wishlist, onWishlistToggle }) {
           ) : (
             <div className={viewMode === 'grid' ? 'product-grid' : 'product-grid list-view'}>
               {filteredProducts.map((product) => (
-                <ProductCard
-                  key={product.id}
-                  product={product}
-                  wishlist={wishlist}
-                  onWishlistToggle={onWishlistToggle}
-                  onAddToCart={onAddToCart}
-                  onQuickView={setQuickViewProduct}
-                />
+                <ProductCard key={product.id} product={product} wishlist={wishlist} onWishlistToggle={onWishlistToggle} onAddToCart={onAddToCart} onQuickView={setQuickViewProduct} />
               ))}
             </div>
           )}
@@ -855,12 +895,7 @@ function FilterGroup({ title, options, value, onChange }) {
       <h4>{title}</h4>
       <div className="filter-options">
         {options.map((option) => (
-          <button
-            key={option}
-            type="button"
-            className={value === option ? 'filter-option active' : 'filter-option'}
-            onClick={() => onChange(option)}
-          >
+          <button key={option} type="button" className={value === option ? 'filter-option active' : 'filter-option'} onClick={() => onChange(option)}>
             {option === 'all' ? 'All' : option}
           </button>
         ))}
@@ -869,22 +904,23 @@ function FilterGroup({ title, options, value, onChange }) {
   );
 }
 
-function ProductPage({ products, onAddToCart, wishlist, onWishlistToggle }) {
+function ProductPage({ products, loading, onAddToCart, wishlist, onWishlistToggle }) {
   const { id } = useParams();
   const navigate = useNavigate();
-  const product = products.find((item) => item.slug === id) || products[0];
-  const [mainImage, setMainImage] = useState(product.images[0]);
-  const [quantity, setQuantity] = useState(1);
+  const product = products.find((item) => item.slug === id || item.id === id) || null;
+  const [selectedImage, setSelectedImage] = useState({ productId: null, image: '' });
+  const [selectedQuantity, setSelectedQuantity] = useState({ productId: null, quantity: 1 });
+  const mainImage = selectedImage.productId === product?.id ? selectedImage.image : product?.images?.[0] || '';
+  const quantity = selectedQuantity.productId === product?.id ? selectedQuantity.quantity : 1;
+  const setQuantity = (update) => {
+    const nextQuantity = typeof update === 'function' ? update(quantity) : update;
+    setSelectedQuantity({ productId: product?.id, quantity: nextQuantity });
+  };
 
-  useEffect(() => {
-    setMainImage(product.images[0]);
-  }, [product]);
-
-  useEffect(() => {
-    document.title = `${product.name} | ${product.brand}`;
-  }, [product]);
-
-  if (!product) return null;
+  if (!product) {
+    if (loading) return <main className="page-shell narrow"><CatalogSkeleton /></main>;
+    return <NotFoundPage />;
+  }
 
   const relatedProducts = products.filter((item) => item.id !== product.id).slice(0, 4);
   const currentRating = Array.from({ length: 5 }, (_, index) => index < Math.round(product.rating));
@@ -902,11 +938,11 @@ function ProductPage({ products, onAddToCart, wishlist, onWishlistToggle }) {
       <section className="product-detail-layout">
         <div className="gallery-panel">
           <div className="main-image-frame">
-            <img src={mainImage} alt={product.name} />
+            <img src={mainImage || product.images[0]} alt={product.name} />
           </div>
           <div className="thumbnail-row">
             {product.images.map((image) => (
-              <button key={image} type="button" className={mainImage === image ? 'thumbnail active' : 'thumbnail'} onClick={() => setMainImage(image)}>
+              <button key={image} type="button" className={mainImage === image ? 'thumbnail active' : 'thumbnail'} onClick={() => setSelectedImage({ productId: product.id, image })}>
                 <img src={image} alt={`${product.name} gallery`} />
               </button>
             ))}
@@ -935,7 +971,7 @@ function ProductPage({ products, onAddToCart, wishlist, onWishlistToggle }) {
           <p className="product-summary">{product.description}</p>
 
           <div className="availability-row">
-            <span className={product.stock > 0 ? 'available' : 'unavailable'}>{product.stock > 0 ? 'In stock' : 'Sold out'}</span>
+            <span className={isProductAvailable(product) ? 'available' : 'unavailable'}>{isProductAvailable(product) ? 'In stock' : 'Sold out'}</span>
             <span>{product.size}</span>
           </div>
 
@@ -943,9 +979,9 @@ function ProductPage({ products, onAddToCart, wishlist, onWishlistToggle }) {
             <div className="quantity-box large">
               <button type="button" aria-label="Decrease quantity" onClick={() => setQuantity((current) => Math.max(1, current - 1))}><Minus size={14} /></button>
               <span>{quantity}</span>
-              <button type="button" aria-label="Increase quantity" onClick={() => setQuantity((current) => current + 1)}><Plus size={14} /></button>
+              <button type="button" aria-label="Increase quantity" disabled={product.stock != null && quantity >= product.stock} onClick={() => setQuantity((current) => Math.min(product.stock ?? 99, current + 1))}><Plus size={14} /></button>
             </div>
-            <button type="button" className="primary-button" onClick={() => onAddToCart(product, quantity)}>Add to Cart</button>
+            <button type="button" className="primary-button" disabled={!isProductAvailable(product)} onClick={() => onAddToCart(product, quantity)}>{isProductAvailable(product) ? 'Add to Cart' : 'Sold Out'}</button>
             <button type="button" className="secondary-button" onClick={() => onWishlistToggle(product.id)}>Wishlist</button>
           </div>
 
@@ -1008,14 +1044,7 @@ function ProductPage({ products, onAddToCart, wishlist, onWishlistToggle }) {
         <SectionHeading eyebrow="More To Explore" title="Related Products" text="Complementary fragrances and favourites from the same collection." />
         <div className="product-grid">
           {relatedProducts.map((item) => (
-            <ProductCard
-              key={item.id}
-              product={item}
-              wishlist={wishlist}
-              onWishlistToggle={onWishlistToggle}
-              onAddToCart={onAddToCart}
-              onQuickView={() => navigate(`/product/${item.slug}`)}
-            />
+            <ProductCard key={item.id} product={item} wishlist={wishlist} onWishlistToggle={onWishlistToggle} onAddToCart={onAddToCart} onQuickView={() => navigate(`/product/${item.slug}`)} />
           ))}
         </div>
       </section>
@@ -1037,11 +1066,7 @@ function AccordionItem({ title, content, defaultOpen = false }) {
   );
 }
 
-function CartPage({ cart, onUpdateQty, onRemove, onCheckout }) {
-  const subtotal = cart.reduce((sum, item) => sum + item.product.price * item.quantity, 0);
-  const shipping = subtotal > 5000 ? 0 : 350;
-  const total = subtotal + shipping;
-
+function CartPage({ cart, subtotal, shipping, total, onUpdateQty, onRemove }) {
   if (!cart.length) {
     return (
       <main className="page-shell narrow center-page">
@@ -1061,20 +1086,21 @@ function CartPage({ cart, onUpdateQty, onRemove, onCheckout }) {
         <div className="cart-main-column">
           <h1>Shopping Cart</h1>
           {cart.map((item) => (
-            <div key={item.id} className="cart-page-item">
-              <img src={item.product.images[0]} alt={item.product.name} />
+            <div key={item.productId || item.id} className="cart-page-item">
+              <img className="cart-page-thumbnail" src={item.product?.images?.[0] || item.image} alt={item.productName || item.product?.name} />
               <div className="cart-information">
-                <h3>{item.product.name}</h3>
-                <p>{item.product.brand}</p>
+                <h3>{item.productName || item.product?.name}</h3>
+                <p>{item.product?.brand || item.brand || 'Maison Élan'}</p>
+                {item.variant && <p className="cart-page-variant">{item.variant}</p>}
                 <div className="quantity-box large">
-                  <button type="button" aria-label={`Decrease quantity for ${item.product.name}`} onClick={() => onUpdateQty(item.id, item.quantity - 1)}><Minus size={14} /></button>
+                  <button type="button" aria-label={`Decrease quantity for ${item.productName || item.product?.name}`} onClick={() => onUpdateQty(item.productId, item.quantity - 1)}><Minus size={14} /></button>
                   <span>{item.quantity}</span>
-                  <button type="button" aria-label={`Increase quantity for ${item.product.name}`} onClick={() => onUpdateQty(item.id, item.quantity + 1)}><Plus size={14} /></button>
+                  <button type="button" aria-label={`Increase quantity for ${item.productName || item.product?.name}`} disabled={(item.product?.stock ?? item.stock) != null && item.quantity >= (item.product?.stock ?? item.stock)} onClick={() => onUpdateQty(item.productId, item.quantity + 1)}><Plus size={14} /></button>
                 </div>
               </div>
               <div className="cart-price-block">
-                <strong>{formatPrice(item.product.price * item.quantity)}</strong>
-                <button type="button" className="text-button" onClick={() => onRemove(item.id)}>Remove</button>
+                <strong>{formatPrice((item.price || item.product?.price || 0) * item.quantity)}</strong>
+                <button type="button" className="text-button" onClick={() => onRemove(item.productId)}>Remove</button>
               </div>
             </div>
           ))}
@@ -1085,35 +1111,149 @@ function CartPage({ cart, onUpdateQty, onRemove, onCheckout }) {
           <div className="summary-row"><span>Subtotal</span><strong>{formatPrice(subtotal)}</strong></div>
           <div className="summary-row"><span>Shipping</span><strong>{shipping === 0 ? 'Free' : formatPrice(shipping)}</strong></div>
           <div className="summary-row total"><span>Total</span><strong>{formatPrice(total)}</strong></div>
-          <Link to="/checkout" className="primary-button wide" onClick={onCheckout}>Proceed to Checkout</Link>
+          <Link to="/checkout" className="primary-button wide">Proceed to Checkout</Link>
         </aside>
       </section>
     </main>
   );
 }
 
-function CheckoutPage({ cart, subtotal, shipping, total }) {
+function CheckoutPage({ cart, subtotal, shipping, total, onShowToast, onClearCart }) {
   const navigate = useNavigate();
+  const submissionLock = useRef(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const [values, setValues] = useState({
+    fullName: '',
+    phone: '',
+    email: '',
+    province: '',
+    city: '',
+    area: '',
+    address: '',
+    notes: '',
+  });
+  const [errors, setErrors] = useState({});
 
-  const handleSubmit = (event) => {
-    event.preventDefault();
-    navigate('/');
+  const handleChange = (event) => {
+    const { name, value } = event.target;
+    setValues((current) => ({ ...current, [name]: value }));
+    setErrors((current) => ({ ...current, [name]: '' }));
   };
+
+  const validate = () => {
+    const nextErrors = {};
+    if (!values.fullName.trim()) nextErrors.fullName = 'Full Name is required';
+    if (!values.phone.trim() || !/^\+?[0-9\s-]{7,15}$/.test(values.phone.trim())) {
+      nextErrors.phone = 'Please enter a valid phone number';
+    }
+    if (!values.email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email.trim())) {
+      nextErrors.email = 'Please enter a valid email';
+    }
+    if (!values.province.trim()) nextErrors.province = 'Province is required';
+    if (!values.city.trim()) nextErrors.city = 'City is required';
+    if (!values.area.trim()) nextErrors.area = 'Area is required';
+    if (!values.address.trim()) nextErrors.address = 'Complete address is required';
+
+    return nextErrors;
+  };
+
+  const handleSubmit = async (event) => {
+    event.preventDefault();
+    if (submissionLock.current) return;
+
+    const nextErrors = validate();
+    setErrors(nextErrors);
+    if (Object.keys(nextErrors).length) {
+      onShowToast?.('Please fix the checkout form errors');
+      return;
+    }
+
+    if (!cart.length) {
+      onShowToast?.('Your cart is empty');
+      return;
+    }
+
+    submissionLock.current = true;
+    setIsSubmitting(true);
+    setSubmitError('');
+
+    try {
+      const order = await createOrder({
+        customer: {
+          fullName: values.fullName.trim(),
+          phone: values.phone.trim(),
+          email: values.email.trim(),
+          province: values.province.trim(),
+          city: values.city.trim(),
+          area: values.area.trim(),
+          address: values.address.trim(),
+          notes: values.notes.trim(),
+        },
+        items: cart.map((item) => ({
+          productId: item.productId,
+          name: item.productName || item.product?.name,
+          image: item.image || item.product?.images?.[0],
+          price: Number(item.price || item.product?.price || 0),
+          quantity: Number(item.quantity || 1),
+          variant: item.variant || null,
+        })),
+        subtotal,
+        shipping,
+        discount: 0,
+        total,
+        paymentMethod: 'Cash on Delivery',
+        paymentStatus: 'pending',
+        status: 'pending',
+      });
+
+      onClearCart?.();
+      navigate('/order-success', {
+        state: {
+          confirmedOrder: {
+            orderId: order.orderId || order.id,
+            total: order.total,
+          },
+        },
+      });
+      onShowToast?.('Order placed successfully');
+    } catch (error) {
+      setSubmitError(error.message || 'We could not place your order. Please try again.');
+      onShowToast?.('We could not place your order. Your cart is unchanged.');
+    } finally {
+      submissionLock.current = false;
+      setIsSubmitting(false);
+    }
+  };
+
+  if (!cart.length) {
+    return (
+      <main className="page-shell narrow center-page">
+        <div className="empty-state">
+          <ShoppingBag size={32} />
+          <h1>Your cart is empty</h1>
+          <p>Add a fragrance to continue to checkout.</p>
+          <Link to="/shop" className="primary-button">Browse products</Link>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="page-shell checkout-shell">
       <div className="checkout-layout">
-        <form className="checkout-form" onSubmit={handleSubmit}>
+        <form className="checkout-form" onSubmit={handleSubmit} noValidate>
           <h1>Checkout</h1>
+          {submitError && <p className="checkout-error" role="alert">{submitError}</p>}
           <div className="field-grid">
-            <label><span>Full Name</span><input type="text" placeholder="Your full name" /></label>
-            <label><span>Phone Number</span><input type="tel" placeholder="03xx-xxxxxxx" /></label>
-            <label><span>Email</span><input type="email" placeholder="name@example.com" /></label>
-            <label><span>Province</span><input type="text" placeholder="Punjab" /></label>
-            <label><span>City</span><input type="text" placeholder="Lahore" /></label>
-            <label><span>Area</span><input type="text" placeholder="Gulshan" /></label>
-            <label className="full-width"><span>Complete Address</span><textarea rows="4" placeholder="Street address, unit, landmark" /></label>
-            <label className="full-width"><span>Order Notes</span><textarea rows="3" placeholder="Optional delivery notes" /></label>
+            <label><span>Full Name</span><input name="fullName" value={values.fullName} onChange={handleChange} type="text" placeholder="Your full name" />{errors.fullName && <small>{errors.fullName}</small>}</label>
+            <label><span>Phone Number</span><input name="phone" value={values.phone} onChange={handleChange} type="tel" placeholder="03xx-xxxxxxx" />{errors.phone && <small>{errors.phone}</small>}</label>
+            <label><span>Email</span><input name="email" value={values.email} onChange={handleChange} type="email" placeholder="name@example.com" />{errors.email && <small>{errors.email}</small>}</label>
+            <label><span>Province</span><input name="province" value={values.province} onChange={handleChange} type="text" placeholder="Punjab" />{errors.province && <small>{errors.province}</small>}</label>
+            <label><span>City</span><input name="city" value={values.city} onChange={handleChange} type="text" placeholder="Lahore" />{errors.city && <small>{errors.city}</small>}</label>
+            <label><span>Area</span><input name="area" value={values.area} onChange={handleChange} type="text" placeholder="Gulshan" />{errors.area && <small>{errors.area}</small>}</label>
+            <label className="full-width"><span>Complete Address</span><textarea name="address" value={values.address} onChange={handleChange} rows="4" placeholder="Street address, unit, landmark" />{errors.address && <small>{errors.address}</small>}</label>
+            <label className="full-width"><span>Order Notes</span><textarea name="notes" value={values.notes} onChange={handleChange} rows="3" placeholder="Optional delivery notes" /></label>
           </div>
 
           <div className="payment-box">
@@ -1121,7 +1261,9 @@ function CheckoutPage({ cart, subtotal, shipping, total }) {
             <label className="radio-option"><input type="radio" name="payment" checked readOnly /> Cash on Delivery</label>
           </div>
 
-          <button type="submit" className="primary-button wide">Place Order</button>
+          <button type="submit" className="primary-button wide" disabled={isSubmitting}>
+            {isSubmitting ? 'Placing Order...' : 'Place Order'}
+          </button>
         </form>
 
         <aside className="summary-panel checkout-summary">
@@ -1131,9 +1273,9 @@ function CheckoutPage({ cart, subtotal, shipping, total }) {
           ) : (
             <div className="checkout-products">
               {cart.map((item) => (
-                <div key={item.id} className="checkout-item">
-                  <span>{item.product.name} × {item.quantity}</span>
-                  <strong>{formatPrice(item.product.price * item.quantity)}</strong>
+                <div key={item.productId || item.id} className="checkout-item">
+                  <span>{item.productName || item.product?.name} × {item.quantity}</span>
+                  <strong>{formatPrice((item.price || item.product?.price || 0) * item.quantity)}</strong>
                 </div>
               ))}
             </div>
@@ -1142,6 +1284,98 @@ function CheckoutPage({ cart, subtotal, shipping, total }) {
           <div className="summary-row"><span>Shipping</span><strong>{shipping === 0 ? 'Free' : formatPrice(shipping)}</strong></div>
           <div className="summary-row total"><span>Total</span><strong>{formatPrice(total)}</strong></div>
         </aside>
+      </div>
+    </main>
+  );
+}
+
+function OrderSuccessPage() {
+  const location = useLocation();
+  const confirmedOrder = location.state?.confirmedOrder;
+
+  if (!confirmedOrder?.orderId || !Number.isFinite(confirmedOrder.total)) {
+    return (
+      <main className="page-shell narrow center-page">
+        <div className="empty-state">
+          <h1>Order confirmation unavailable</h1>
+          <p>We could not verify an order from this page. Check your order status before trying checkout again.</p>
+          <Link to="/shop" className="primary-button">Continue Shopping</Link>
+        </div>
+      </main>
+    );
+  }
+
+  const { orderId, total } = confirmedOrder;
+
+  return (
+    <main className="page-shell narrow center-page">
+      <div className="empty-state success-state">
+        <Check size={36} />
+        <h1>Order placed successfully</h1>
+        <p>Your order has been created and is awaiting confirmation.</p>
+        <div className="success-grid">
+          <div><span>Order ID</span><strong>{orderId}</strong></div>
+          <div><span>Total</span><strong>{formatPrice(total)}</strong></div>
+        </div>
+        <div className="cta-row">
+          <Link to="/shop" className="primary-button">Continue Shopping</Link>
+          <Link to="/" className="secondary-button">Back to Home</Link>
+        </div>
+      </div>
+    </main>
+  );
+}
+
+function WishlistPage({ products, loading, wishlist, onWishlistToggle, onAddToCart }) {
+  const navigate = useNavigate();
+  const savedProducts = products.filter((product) => wishlist.includes(product.id));
+
+  return (
+    <main className="page-shell narrow">
+      <SectionHeading eyebrow="Saved Fragrances" title="Your Wishlist" text="Your saved fragrances, ready when you are." />
+      {loading ? <CatalogSkeleton /> : savedProducts.length ? (
+        <div className="product-grid">
+          {savedProducts.map((product) => (
+            <ProductCard key={product.id} product={product} wishlist={wishlist} onWishlistToggle={onWishlistToggle} onAddToCart={onAddToCart} onQuickView={() => navigate(`/product/${product.slug}`)} />
+          ))}
+        </div>
+      ) : (
+        <div className="empty-state">
+          <Heart size={30} />
+          <h3>Your wishlist is empty</h3>
+          <p>Save fragrances you would like to revisit.</p>
+          <Link to="/shop" className="primary-button">Browse Collection</Link>
+        </div>
+      )}
+    </main>
+  );
+}
+
+function CatalogSkeleton() {
+  return (
+    <div className="skeleton-grid" aria-label="Loading products" role="status">
+      {Array.from({ length: 4 }, (_, index) => (
+        <div className="skeleton-card" key={index}>
+          <div className="skeleton-media" />
+          <div className="skeleton-content">
+            <div className="skeleton-line short" />
+            <div className="skeleton-line medium" />
+            <div className="skeleton-button" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NotFoundPage() {
+  return (
+    <main className="page-shell narrow center-page">
+      <div className="empty-state">
+        <Sparkles size={32} />
+        <h1>Product not found</h1>
+        <p>The fragrance you’re looking for is no longer available or may have moved.</p>
+        <Link to="/shop" className="primary-button">Browse Collection</Link>
       </div>
     </main>
   );
@@ -1250,9 +1484,9 @@ function Footer({ brandName }) {
           <div className="brand-mark footer-brand">{brandName}</div>
           <p>Luxury fragrance curation for everyday rituals and memorable moments.</p>
           <div className="social-row">
-            <a href="#" aria-label="Instagram">◎</a>
-            <a href="#" aria-label="Facebook">◌</a>
-            <a href="#" aria-label="TikTok">◍</a>
+            <a href="#" aria-label="Instagram">?</a>
+            <a href="#" aria-label="Facebook">?</a>
+            <a href="#" aria-label="TikTok">?</a>
           </div>
         </div>
         <div>
